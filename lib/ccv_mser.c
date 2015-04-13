@@ -54,7 +54,105 @@ typedef struct {
 	int stable;
 	ccv_mser_node_t* head;
 	ccv_mser_node_t* tail;
+    ccv_array_t* children;
 } ccv_mser_history_t; /* extend ccv_mser_node_t to record more information about the region */
+
+static void _ccv_mser_add_child(ccv_mser_history_t* p, ccv_mser_history_t** c)
+{
+  if (!p->children) {
+    // according to my statistics, 99% msers have less than 2 children,
+    // while ccv's mininum array elements is 2
+    // TODO
+    p->children = ccv_array_new(sizeof(ccv_mser_history_t*), 2, 0);
+  }
+  ccv_array_push(p->children, c);
+}
+
+static int _ccv_mser_n_children(const ccv_mser_history_t* m)
+{
+  if (m->children == 0) {
+    return 0;
+  }
+  return m->children->rnum;
+}
+
+int more_stable(const ccv_mser_history_t* a, const ccv_mser_history_t* b)
+{
+  if (a->variance <= b->variance)
+    return 1;
+  return 0;
+}
+
+static ccv_mser_history_t* _ccv_linear_reduction(ccv_mser_history_t* t,
+                                                 int (*cmp)(const ccv_mser_history_t* a, const ccv_mser_history_t* b))
+{
+  if (_ccv_mser_n_children(t) == 0) {
+    return t;
+  } else if (_ccv_mser_n_children(t) == 1) {
+    int i;
+    ccv_mser_history_t* tc;
+    ccv_mser_history_t* c = *(ccv_mser_history_t**)ccv_array_get(t->children, 0);
+    ccv_array_clear(t->children);
+    tc = _ccv_linear_reduction(c, cmp);
+    if (cmp(tc, t))
+      return tc;
+
+
+    for (i = 0; i < _ccv_mser_n_children(tc); i++) {
+      ccv_mser_history_t** child = (ccv_mser_history_t**)ccv_array_get(tc->children, i);
+      ccv_array_push(t->children, child);
+    }
+    if (tc->children != 0)
+      ccv_array_clear(tc->children);
+
+    return t;
+  } else {
+    int i = 0;
+    ccv_array_t children = *(t->children);
+    ccv_array_clear(t->children);
+    for ( ; i < children.rnum; ++i) {
+      ccv_mser_history_t* c = *(ccv_mser_history_t**)ccv_array_get(&children, i);
+      ccv_mser_history_t* ct = _ccv_linear_reduction(c, cmp);
+      ccv_array_push(t->children, &ct);
+    }
+    return t;
+  }
+}
+
+static ccv_array_t* _ccv_tree_accumulation(ccv_mser_history_t* t, int level,
+                                           int (*cmp)(const ccv_mser_history_t* a, const ccv_mser_history_t* b))
+{
+  int i;
+  ccv_array_t* set;
+  ccv_array_t* t_set;
+  assert(_ccv_mser_n_children(t) != 1);
+
+  if (_ccv_mser_n_children(t) == 0) {
+    ccv_array_t* set = ccv_array_new(sizeof(ccv_mser_history_t*), 1, 0);
+    ccv_array_push(set, &t);
+    return set;
+  }
+
+  set = ccv_array_new(sizeof(ccv_mser_history_t*), 3, 0);
+  for (i = 0; i < t->children->rnum; ++i) {
+    ccv_mser_history_t* c = *(ccv_mser_history_t**)ccv_array_get(t->children, i);
+    ccv_array_t* c_set = _ccv_tree_accumulation(c, level + 1, cmp);
+    int j = 0;
+    for (; j < c_set->rnum; ++j) {
+      ccv_array_push(set, (ccv_mser_history_t**)ccv_array_get(c_set, j));
+    }
+  }
+  for (i = 0; i < set->rnum; ++i) {
+    ccv_mser_history_t* c = *(ccv_mser_history_t**)ccv_array_get(set, i);
+    if (cmp(c, t))
+      return set;
+  }
+
+  ccv_array_clear(t->children);
+  t_set = ccv_array_new(sizeof(ccv_mser_history_t*), 1, 0);
+  ccv_array_push(t_set, &t);
+  return t_set;
+}
 
 static void _ccv_set_union_mser(ccv_dense_matrix_t* a, ccv_dense_matrix_t* h, ccv_dense_matrix_t* b, ccv_array_t* seq, ccv_mser_param_t params)
 {
@@ -307,6 +405,60 @@ static void _ccv_set_union_mser(ccv_dense_matrix_t* a, ccv_dense_matrix_t* h, cc
 			}
 		}
 	}
+
+    // Every stable non-root node assigned a stable parent,
+    // if no stable parent was found, this node becames a root node.
+    for (i = 0; i < history_list->rnum; i++) {
+      ccv_mser_history_t* er = (ccv_mser_history_t*)ccv_array_get(history_list, i);
+      if (er->parent != i && er->stable) {
+        ccv_mser_history_t* per = (ccv_mser_history_t*)ccv_array_get(history_list, er->parent);
+        while (!per->stable) {
+          ccv_mser_history_t* ner = (ccv_mser_history_t*)ccv_array_get(history_list, per->parent);
+          // found a root node
+          if (ner == per)
+            break;
+          per = ner;
+        }
+        if (per->stable)
+          _ccv_mser_add_child(per, &er);
+        else
+          er->parent = i;
+      }
+    }
+
+    int ntrees = 0;
+    // linear reduction
+    ccv_array_t* linear_reduction_ers = ccv_array_new(sizeof(ccv_mser_history_t*), history_list->rnum, 0);
+    for (i = 0; i < history_list->rnum; i++) {
+      ccv_mser_history_t* er = (ccv_mser_history_t*)ccv_array_get(history_list, i);
+      if (er->parent == i && er->stable) {
+        ccv_mser_history_t* ter;
+        ntrees++;
+        ter = _ccv_linear_reduction(er, more_stable);
+        ccv_array_push(linear_reduction_ers, &ter);
+      }
+    }
+
+    // tree accumualtion
+    ccv_array_t* tree_accumulated_ers = ccv_array_new(sizeof(ccv_mser_history_t*), ntrees * 1.1, 0);
+    for (i = 0; i < linear_reduction_ers->rnum; i++) {
+      ccv_mser_history_t* er = *(ccv_mser_history_t**)ccv_array_get(linear_reduction_ers, i);
+      ccv_array_t* s = _ccv_tree_accumulation(er, 0, more_stable);
+      int j;
+      for (j = 0; j < s->rnum; ++j) {
+        ccv_array_push(tree_accumulated_ers, (ccv_mser_history_t**)ccv_array_get(s, j));
+      }
+    }
+    printf("tree_accumulated_ers->rnum: %d\n", tree_accumulated_ers->rnum);
+    /* /\* TODO remove this *\/ */
+    /* history_list = tree_accumulated_ers; */
+
+    ccv_array_clear(history_list);
+    for (int i = 0; i < tree_accumulated_ers->rnum; ++i) {
+      ccv_mser_history_t* er = *(ccv_mser_history_t**)ccv_array_get(tree_accumulated_ers, i);
+      ccv_array_push(history_list, er);
+    }
+
 	assert(seq->rsize == sizeof(ccv_mser_keypoint_t));
 	ccv_zero(b);
 	unsigned char* b_ptr = b->data.u8;
