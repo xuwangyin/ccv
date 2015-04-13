@@ -150,6 +150,12 @@ static void _ccv_set_union_mser(ccv_dense_matrix_t* a, ccv_dense_matrix_t* h, cc
 				if (x >= 0 && x < a->cols && y >= 0 && y < a->rows)
 				{
 					ccv_mser_node_t* nnode = pnode + dx[j] + dy[j] * a->cols;
+#define block(_, _get) \
+					if ((params.direction == CCV_DARK_TO_BRIGHT && _get(a->data.u8 + y * a->step, x, 0) > v) || \
+                        (params.direction == CCV_BRIGHT_TO_DARK && _get(a->data.u8 + y * a->step, x, 0) < v)) \
+                      continue;
+                    ccv_matrix_getter_integer_only(a->type, block);
+#undef block
 					if (nnode->shortcut == 0) // this is a void node, skip
 						continue;
 					ccv_mser_node_t* node1 = _ccv_mser_find_root(nnode);
